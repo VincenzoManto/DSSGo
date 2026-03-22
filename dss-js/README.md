@@ -16,13 +16,13 @@ The library is downloadable from [npmjs](https://www.npmjs.com/package/sdk-dss/)
 
 ```
 # Local usage (no publish required)
-npm install ./dss-js
+npm install sdk-dss
 ```
 
 ## Usage
 
 ```js
-const { parseDSS, serializeDSS, csvToDSS, dssToCSV, xlsxToDSS, dssToXLSX } = require('dss-js');
+const { parseDSS, serializeDSS, csvToDSS, dssToCSV, xlsxToDSS, dssToXLSX } = require('sdk-dss');
 
 const dss = parseDSS(dssString);
 const dssString = serializeDSS(dss);
