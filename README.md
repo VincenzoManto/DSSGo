@@ -1,5 +1,7 @@
 # Specification: Data Sheet Standard (DSS) v1.0
 
+![](https://zenodo.org/badge/DOI/10.5281/zenodo.19659516.svg)
+
 **Status:** Proposal / Draft v1.0  
 **Author:** Vincenzo Manto @ datastripes.com / ilovecsv.com / ihatecsv.com  
 **Extension:** `.DSS`  
