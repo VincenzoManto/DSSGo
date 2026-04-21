@@ -1,6 +1,6 @@
 # DSS
 
-`dss-go` is a Go command-line tool for loading DSS, CSV, XLS, XLSX, and XLSM workbooks, computing formulas, editing them in a full-screen terminal spreadsheet view with bordered cells, visualizing workbook summaries in a termdash dashboard, and exporting back to DSS.
+`dss-go` is a Go command-line tool for loading [DSS](https://github.com/Datastripes/DataSheetStandard), CSV, XLS, XLSX, and XLSM workbooks, computing formulas, editing them in a full-screen terminal spreadsheet view with bordered cells, visualizing workbook summaries in a termdash dashboard, and exporting back to DSS.
 
 ## Current Commands
 
