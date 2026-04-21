@@ -148,6 +148,11 @@ func WriteFile(path string, wb *workbook.Workbook) error {
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 
+
+func WriteRaw(path string, text string) error {
+	return os.WriteFile(path, []byte(text), 0o644)
+}
+
 func collectAnchorBlock(lines []string, start int) (string, int) {
 	var block strings.Builder
 	inQuotes := false

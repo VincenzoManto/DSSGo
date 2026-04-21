@@ -5,12 +5,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"unicode"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"github.com/vincm/dss/dss-go/internal/dashboard"
 	"github.com/vincm/dss/dss-go/internal/dss"
+	"github.com/vincm/dss/dss-go/internal/dssview"
 	"github.com/vincm/dss/dss-go/internal/formula"
 	"github.com/vincm/dss/dss-go/internal/importers"
 	"github.com/vincm/dss/dss-go/internal/workbook"
@@ -21,6 +23,26 @@ const (
 	cellWidth     = 16
 	minGridRows   = 5
 )
+
+// saveResultMsg is returned by the async save command.
+type saveResultMsg struct{ err error }
+
+// recalcResultMsg signals the async recalc is done.
+type recalcResultMsg struct{}
+
+func saveCmd(outputPath string, wb *workbook.Workbook) tea.Cmd {
+	return func() tea.Msg {
+		err := dss.WriteFile(outputPath, wb)
+		return saveResultMsg{err: err}
+	}
+}
+
+func recalcCmd(wb *workbook.Workbook) tea.Cmd {
+	return func() tea.Msg {
+		formula.RecalculateWorkbook(wb)
+		return recalcResultMsg{}
+	}
+}
 
 type model struct {
 	workbook   *workbook.Workbook
@@ -46,6 +68,7 @@ type model struct {
 	status       string
 	quit         bool
 	openDash     bool
+	openDSS      bool
 }
 
 var displayModes = []string{"values", "formulas", "both"}
@@ -83,6 +106,40 @@ func Run(inputPath string, outputPath string) error {
 		if !ok || !m.quit {
 			return nil
 		}
+
+		if m.openDSS {
+			res, err := dssview.Run(m.outputPath, m.workbook)
+			if err != nil {
+				return err
+			}
+			switch res.Action {
+			case dssview.ExitToTUI:
+				m.workbook = res.Workbook
+				m.quit = false
+				m.openDSS = false
+				m.status = "Returned from DSS editor"
+				currentModel = m
+				continue
+			case dssview.ExitToDashboard:
+				action, err := dashboard.RunWorkbook(m.inputPath, res.Workbook)
+				if err != nil {
+					return err
+				}
+				if action != dashboard.ExitToTUI {
+					return nil
+				}
+				m.workbook = res.Workbook
+				m.quit = false
+				m.openDSS = false
+				m.openDash = false
+				m.status = "Returned from dashboard"
+				currentModel = m
+				continue
+			default:
+				return nil
+			}
+		}
+
 		if !m.openDash {
 			return nil
 		}
@@ -119,6 +176,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = msg.Height
 		m.ensureVisible()
 		return m, nil
+	case saveResultMsg:
+		if msg.err != nil {
+			m.status = "Save failed: " + msg.err.Error()
+		} else {
+			m.status = "Saved to " + m.outputPath
+		}
+		return m, nil
+	case recalcResultMsg:
+		m.status = "Recalculated"
+		return m, nil
 	case tea.KeyMsg:
 		if m.promptActive {
 			return m.updatePrompt(msg)
@@ -140,6 +207,10 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.quit = true
 		m.openDash = true
 		return m, tea.Quit
+	case "s":
+		m.quit = true
+		m.openDSS = true
+		return m, tea.Quit
 	case "up", "k":
 		if m.row > 0 {
 			m.row--
@@ -153,23 +224,16 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "right", "l":
 		m.col++
 	case "enter", "e":
-		m.editMode = true
-		if cell := m.currentSheet().GetCell(m.row, m.col); cell != nil {
-			m.editBuffer = cell.Input
-		} else {
-			m.editBuffer = ""
-		}
-		m.editCursor = len([]rune(m.editBuffer))
-		m.status = "Editing cell " + m.currentCoord().A1() + ". Enter applies, Esc cancels, arrows move the edit cursor."
+		m.beginEdit(currentCellInput(m), false, "Editing cell "+m.currentCoord().A1()+". Enter applies, Esc cancels.")
+		return m, nil
 	case "ctrl+s":
-		if err := dss.WriteFile(m.outputPath, m.workbook); err != nil {
-			m.status = "Save failed: " + err.Error()
-		} else {
-			m.status = "Saved DSS to " + m.outputPath
-		}
+		m.status = "Saving…"
+		m.ensureVisible()
+		return m, saveCmd(m.outputPath, m.workbook)
 	case "r":
-		formula.RecalculateWorkbook(m.workbook)
-		m.status = "Recalculated workbook"
+		m.status = "Recalculating…"
+		m.ensureVisible()
+		return m, recalcCmd(m.workbook)
 	case "tab", "]", "pgdown":
 		if len(m.workbook.Sheets) > 0 {
 			m.sheetIndex = (m.sheetIndex + 1) % len(m.workbook.Sheets)
@@ -233,6 +297,15 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.promptTarget = "rename"
 		m.status = "Enter new name for sheet, then press Enter"
 	}
+	if shouldStartDirectEdit(msg) {
+		text := string(msg.Runes)
+		m.beginEdit(text, true, "Editing cell "+m.currentCoord().A1()+". Typing replaced the current value.")
+		return m, nil
+	}
+	if msg.Type == tea.KeySpace {
+		m.beginEdit(" ", true, "Editing cell "+m.currentCoord().A1()+". Typing replaced the current value.")
+		return m, nil
+	}
 	m.ensureVisible()
 	return m, nil
 }
@@ -245,10 +318,9 @@ func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "enter":
 		m.currentSheet().SetCell(m.row, m.col, m.editBuffer)
-		formula.RecalculateWorkbook(m.workbook)
 		m.editMode = false
 		m.status = "Updated " + m.currentCoord().A1()
-		return m, nil
+		return m, recalcCmd(m.workbook)
 	case "left", "ctrl+b":
 		if m.editCursor > 0 {
 			m.editCursor--
@@ -319,17 +391,16 @@ func (m model) View() string {
 	var builder strings.Builder
 	builder.WriteString(titleStyle.Render("DSS Terminal Spreadsheet"))
 	builder.WriteString("\n")
-	builder.WriteString(renderTabs(m.workbook.Sheets, m.sheetIndex))
+	builder.WriteString(fitPlainLine(renderTabs(m.workbook.Sheets, m.sheetIndex), m.width))
 	builder.WriteString("\n")
-	builder.WriteString("Input: " + m.inputPath + "\n")
-	builder.WriteString("Save:  " + m.outputPath + "\n")
-	builder.WriteString(renderFormulaBar(m))
+	builder.WriteString(fitPlainLine("File: "+m.inputPath+"  Save: "+m.outputPath, m.width))
+	builder.WriteString(fitPlainLine(renderFormulaBar(m), m.width))
 	builder.WriteString("\n")
 	if m.editMode {
-		builder.WriteString(renderMultilineEditBox(m))
+		builder.WriteString(fitPlainLine("Editing: type to update, Enter applies, Esc cancels", m.width))
 		builder.WriteString("\n")
 	} else {
-		builder.WriteString(renderDashboardStrip(m))
+		builder.WriteString(fitPlainLine(renderDashboardStrip(m), m.width))
 		builder.WriteString("\n")
 	}
 	builder.WriteString(m.renderGrid())
@@ -338,9 +409,9 @@ func (m model) View() string {
 		builder.WriteString(renderPromptBox(m))
 		builder.WriteString("\n")
 	}
-	builder.WriteString(m.status + "\n")
-	builder.WriteString("Keys: arrows move, Enter edit, Tab/Shift+Tab sheet, d dashboard, Ctrl+S save, q quit\n")
-	builder.WriteString("Advanced: h/j/k/l move, r recalc, m mode, x clear, o/O rows, D delete row, C/E columns, N new sheet, F2 rename")
+	builder.WriteString(fitPlainLine(m.status, m.width) + "\n")
+	builder.WriteString(fitPlainLine("Keys: arrows move, type to edit, Enter edit current value, Tab/Shift+Tab sheet, d dashboard, s DSS source, Ctrl+S save, q quit", m.width) + "\n")
+	builder.WriteString(fitPlainLine("Advanced: h/j/k/l move, r recalc, m mode, x clear, o/O rows, D delete row, C/E columns, N new sheet, F2 rename", m.width))
 	return builder.String()
 }
 
@@ -381,7 +452,7 @@ func (m model) renderGrid() string {
 		builder.WriteString("│")
 		for col := 0; col < colsVisible; col++ {
 			absoluteCol := m.colOffset + col
-			content := m.renderGridCell(sheet.GetCell(absoluteRow, absoluteCol))
+			content := m.renderGridCell(absoluteRow, absoluteCol, sheet.GetCell(absoluteRow, absoluteCol))
 			if absoluteRow == m.row && absoluteCol == m.col {
 				content = styleSelectedGridContent(content, cellWidth)
 			} else {
@@ -401,7 +472,10 @@ func (m model) renderGrid() string {
 	return builder.String()
 }
 
-func (m model) renderGridCell(cell *workbook.Cell) string {
+func (m model) renderGridCell(row int, col int, cell *workbook.Cell) string {
+	if m.editMode && row == m.row && col == m.col {
+		return m.editBuffer
+	}
 	if cell == nil {
 		return ""
 	}
@@ -447,9 +521,24 @@ func (m model) currentCellSummary() string {
 func renderFormulaBar(m model) string {
 	coord := m.currentCoord()
 	cell := m.currentSheet().GetCell(m.row, m.col)
+	available := m.width - 34
+	if available < 18 {
+		available = 18
+	}
+	inputWidth := available / 2
+	valueWidth := available / 3
+	errorWidth := available - inputWidth - valueWidth
+	if errorWidth < 6 {
+		errorWidth = 6
+	}
 	input := "<empty>"
 	value := "<empty>"
 	errorText := "none"
+	if m.editMode {
+		input = trimToWidth(printable(m.editBuffer), inputWidth)
+		value = "editing..."
+		return "Cell " + coord.A1() + " | Input: " + input + " | Value: " + trimToWidth(value, valueWidth) + " | Error: " + trimToWidth(errorText, errorWidth)
+	}
 	if cell != nil {
 		input = printable(cell.Input)
 		value = printable(cell.Value)
@@ -463,12 +552,7 @@ func renderFormulaBar(m model) string {
 	if cell != nil && cell.Error != "" {
 		errorText = errorCellStyle.Render(errorText)
 	}
-	return renderBoxRow([]boxData{
-		{Title: "Cell", Value: coord.A1()},
-		{Title: "Input", Value: input},
-		{Title: "Value", Value: value},
-		{Title: "Error", Value: errorText},
-	})
+	return "Cell " + coord.A1() + " | Input: " + trimToWidth(stripANSI(input), inputWidth) + " | Value: " + trimToWidth(stripANSI(value), valueWidth) + " | Error: " + trimToWidth(stripANSI(errorText), errorWidth)
 }
 
 func printable(value string) string {
@@ -670,51 +754,7 @@ func renderDashboardStrip(m model) string {
 			errorCount++
 		}
 	}
-	return renderBoxRow([]boxData{
-		{Title: "Sheet", Value: m.currentSheet().Name},
-		{Title: "Mode", Value: displayModes[m.modeIndex]},
-		{Title: "Cells", Value: fmt.Sprintf("%d", filled)},
-		{Title: "Formulas", Value: fmt.Sprintf("%d", formulaCount)},
-		{Title: "Errors", Value: fmt.Sprintf("%d", errorCount)},
-	})
-}
-
-func renderBoxRow(boxes []boxData) string {
-	if len(boxes) == 0 {
-		return ""
-	}
-	lineGroups := make([][]string, 0, len(boxes))
-	for _, item := range boxes {
-		lineGroups = append(lineGroups, renderInfoBox(item.Title, item.Value))
-	}
-	var builder strings.Builder
-	for lineIndex := 0; lineIndex < len(lineGroups[0]); lineIndex++ {
-		for boxIndex, lines := range lineGroups {
-			if boxIndex > 0 {
-				builder.WriteString("  ")
-			}
-			builder.WriteString(lines[lineIndex])
-		}
-		if lineIndex < len(lineGroups[0])-1 {
-			builder.WriteString("\n")
-		}
-	}
-	return builder.String()
-}
-
-func renderInfoBox(title string, value string) []string {
-	contentWidth := runeLen(title)
-	if runeLen(value) > contentWidth {
-		contentWidth = runeLen(value)
-	}
-	contentWidth += 2
-	return []string{
-		"┌" + strings.Repeat("─", contentWidth) + "┐",
-		"│" + padCenter(title, contentWidth) + "│",
-		"├" + strings.Repeat("─", contentWidth) + "┤",
-		"│" + padCenter(trimToWidth(value, contentWidth), contentWidth) + "│",
-		"└" + strings.Repeat("─", contentWidth) + "┘",
-	}
+	return fmt.Sprintf("Sheet: %s | Mode: %s | Cells: %d | Formulas: %d | Errors: %d", m.currentSheet().Name, displayModes[m.modeIndex], filled, formulaCount, errorCount)
 }
 
 func (m *model) ensureVisible() {
@@ -741,11 +781,23 @@ func (m *model) ensureVisible() {
 }
 
 func (m model) visibleRowCount() int {
-	rows := m.height - 17
-	if rows < minGridRows {
-		rows = minGridRows
+	return 10
+}
+
+func (m model) chromeHeight() int {
+	height := 0
+	height += 3 // title, tabs, file/save line
+	height += 2 // formula bar + spacer
+	if m.editMode {
+		height += 2 // compact edit line + spacer
+	} else {
+		height += 2 // dashboard strip + spacer
 	}
-	return rows
+	if m.promptActive {
+		height += 6 // prompt box + spacer
+	}
+	height += 3 // status + help lines
+	return height
 }
 
 func (m model) visibleColCount() int {
@@ -769,77 +821,49 @@ func (m model) currentSheet() *workbook.Sheet {
 func (m model) currentCoord() workbook.Coord {
 	return workbook.Coord{Row: m.row, Col: m.col}
 }
+
+func currentCellInput(m model) string {
+	if cell := m.currentSheet().GetCell(m.row, m.col); cell != nil {
+		return cell.Input
+	}
+	return ""
+}
+
+func shouldStartDirectEdit(msg tea.KeyMsg) bool {
+	if msg.Type != tea.KeyRunes || len(msg.Runes) == 0 || msg.Alt {
+		return false
+	}
+	for _, r := range msg.Runes {
+		if !unicode.IsPrint(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+func fitPlainLine(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	return trimToWidth(value, width)
+}
+
+func (m *model) beginEdit(initial string, replace bool, status string) {
+	m.editMode = true
+	if replace {
+		m.editBuffer = initial
+	} else {
+		m.editBuffer = initial
+	}
+	m.editCursor = len([]rune(m.editBuffer))
+	m.status = status
+}
 func (m model) editInnerWidth() int {
 	w := m.width - 4
 	if w < 20 {
 		w = 20
 	}
 	return w
-}
-
-// renderMultilineEditBox renders a full-width bordered textarea for the edit buffer.
-// Content wraps at editInnerWidth, cursor shown in context; Up/Down in edit mode shift by innerWidth.
-func renderMultilineEditBox(m model) string {
-	innerWidth := m.editInnerWidth()
-	bufRunes := []rune(m.editBuffer)
-	cursor := m.editCursor
-	if cursor < 0 {
-		cursor = 0
-	}
-	if cursor > len(bufRunes) {
-		cursor = len(bufRunes)
-	}
-
-	// Split the buffer into visual lines of innerWidth
-	var lines [][]rune
-	for i := 0; i <= len(bufRunes); i += innerWidth {
-		end := i + innerWidth
-		if end > len(bufRunes) {
-			end = len(bufRunes)
-		}
-		lines = append(lines, bufRunes[i:end])
-		if end == len(bufRunes) {
-			break
-		}
-	}
-	if len(lines) == 0 {
-		lines = [][]rune{{}}
-	}
-
-	cursorLine := cursor / innerWidth
-	cursorCol := cursor % innerWidth
-
-	// Show 3 content rows; scroll so cursorLine is always visible
-	visRows := 3
-	startLine := cursorLine - visRows + 1
-	if startLine < 0 {
-		startLine = 0
-	}
-
-	var builder strings.Builder
-	title := " Edit — Up/Down move cursor line, Esc cancels, Enter confirms "
-	boxWidth := innerWidth + 2
-	builder.WriteString("┌")
-	builder.WriteString(trimToWidth(title+"─"+strings.Repeat("─", boxWidth), boxWidth))
-	builder.WriteString("┐\n")
-	for i := startLine; i < startLine+visRows; i++ {
-		builder.WriteString("│ ")
-		var lineContent string
-		if i < len(lines) {
-			if i == cursorLine {
-				lineContent = renderEditBuffer(string(lines[i]), cursorCol)
-			} else {
-				lineContent = string(lines[i])
-			}
-		}
-		plain := padRight(lineContent, innerWidth)
-		builder.WriteString(plain)
-		builder.WriteString(" │\n")
-	}
-	builder.WriteString("└")
-	builder.WriteString(strings.Repeat("─", boxWidth))
-	builder.WriteString("┘")
-	return builder.String()
 }
 
 // renderPromptBox renders a centered prompt input overlay.

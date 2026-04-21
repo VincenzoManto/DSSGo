@@ -14,14 +14,16 @@ dss set <input> <output.dss> --sheet NAME --cell A1 --value VALUE
 
 Passing a workbook path directly opens the interactive TUI.
 
-The UI shows a bordered spreadsheet grid, a dedicated formula/value bar for the selected cell, color-coded formula/error states, and an inline editor with cursor movement.
+The UI shows a bordered spreadsheet grid, a compact formula/value bar for the selected cell, color-coded formula/error states, and live editing directly in the selected cell.
 
 ![Example of the TUI showing a sheet with various formulas, errors, and the formula bar](./doc/image.png)
 
 ## Controls
 
 - Move with arrow keys or `h`, `j`, `k`, `l`
-- Edit the current cell with `Enter`
+- Start editing immediately by typing
+- Edit the current cell without replacing it with `Enter`
+- While editing, the current text is shown live in the selected cell and in the top info bar
 - Move inside the edit buffer with arrow keys, `Home`, `End`, `Ctrl+A`, and `Ctrl+E`
 - Clear edit content with `Ctrl+U`
 - Save DSS with `Ctrl+S`

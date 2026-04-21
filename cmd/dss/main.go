@@ -31,6 +31,8 @@ func run(args []string) error {
 		return runTUI(args)
 	}
 
+	fmt.Println("Loading...")
+
 	switch args[0] {
 	case "convert":
 		return runConvert(args[1:])
