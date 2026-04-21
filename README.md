@@ -14,26 +14,32 @@ dss set <input> <output.dss> --sheet NAME --cell A1 --value VALUE
 
 Passing a workbook path directly opens the interactive TUI.
 
-The TUI shows a bordered spreadsheet grid, a dedicated formula/value bar for the selected cell, color-coded formula/error states, and an inline editor with cursor movement.
+The UI shows a bordered spreadsheet grid, a dedicated formula/value bar for the selected cell, color-coded formula/error states, and an inline editor with cursor movement.
 
-## TUI Controls
+![Example of the TUI showing a sheet with various formulas, errors, and the formula bar](./doc/image.png)
+
+## Controls
 
 - Move with arrow keys or `h`, `j`, `k`, `l`
-- Edit the current cell with `Enter` or `e`
+- Edit the current cell with `Enter`
 - Move inside the edit buffer with arrow keys, `Home`, `End`, `Ctrl+A`, and `Ctrl+E`
 - Clear edit content with `Ctrl+U`
 - Save DSS with `Ctrl+S`
 - Recalculate with `r`
-- Switch sheets with `[` and `]`
+- Switch sheets with `Tab` and `Shift+Tab`
 - Cycle display mode with `m`
 - Open the dashboard for the current file with `d`
 - Quit with `q`
+- Advanced sheet aliases remain available with `[` and `]`
 
 ## Dashboard
 
 - `dss dashboard <input>` opens a workbook summary dashboard built with `termdash`
 - The dashboard shows workbook totals, sheet ranges, formula/error counts, and quick usage hints
+- Press `Enter` or `e` to jump back into the editable spreadsheet view
 - Close it with `q`, `Ctrl+Q`, or `Ctrl+C`
+
+![Example of the dashboard showing workbook summaries and usage hints](./doc/dashboard.png)
 
 ## Current Formula Support
 

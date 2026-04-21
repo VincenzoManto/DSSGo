@@ -37,9 +37,15 @@ type model struct {
 	editMode   bool
 	editBuffer string
 	editCursor int
-	status     string
-	quit       bool
-	openDash   bool
+	// prompt overlay (rename sheet / new sheet)
+	promptActive bool
+	promptLabel  string
+	promptBuffer string
+	promptCursor int
+	promptTarget string // "rename" or "new_sheet"
+	status       string
+	quit         bool
+	openDash     bool
 }
 
 var displayModes = []string{"values", "formulas", "both"}
@@ -61,23 +67,37 @@ func Run(inputPath string, outputPath string) error {
 	if outputPath == "" {
 		outputPath = defaultOutputPath(inputPath)
 	}
-	program := tea.NewProgram(model{
+	currentModel := model{
 		workbook:   wb,
 		inputPath:  inputPath,
 		outputPath: outputPath,
-		status:     "Arrows move, Enter edits, Ctrl+S saves, [ and ] switch sheets, m changes display mode.",
-	}, tea.WithAltScreen())
-	finalModel, err := program.Run()
-	if err != nil {
-		return err
+		status:     "Arrows move, Enter edits, Tab changes sheet, d opens dashboard, Ctrl+S saves.",
 	}
-	if m, ok := finalModel.(model); ok && m.quit {
-		if m.openDash {
-			return dashboard.Run(m.inputPath)
+	for {
+		program := tea.NewProgram(currentModel, tea.WithAltScreen())
+		finalModel, err := program.Run()
+		if err != nil {
+			return err
 		}
-		return nil
+		m, ok := finalModel.(model)
+		if !ok || !m.quit {
+			return nil
+		}
+		if !m.openDash {
+			return nil
+		}
+		action, err := dashboard.RunWorkbook(m.inputPath, m.workbook)
+		if err != nil {
+			return err
+		}
+		if action != dashboard.ExitToTUI {
+			return nil
+		}
+		m.quit = false
+		m.openDash = false
+		m.status = "Returned from dashboard"
+		currentModel = m
 	}
-	return nil
 }
 
 func defaultOutputPath(inputPath string) string {
@@ -100,6 +120,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.ensureVisible()
 		return m, nil
 	case tea.KeyMsg:
+		if m.promptActive {
+			return m.updatePrompt(msg)
+		}
 		if m.editMode {
 			return m.updateEdit(msg)
 		}
@@ -147,13 +170,13 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		formula.RecalculateWorkbook(m.workbook)
 		m.status = "Recalculated workbook"
-	case "tab", "]":
+	case "tab", "]", "pgdown":
 		if len(m.workbook.Sheets) > 0 {
 			m.sheetIndex = (m.sheetIndex + 1) % len(m.workbook.Sheets)
 			m.row, m.col, m.rowOffset, m.colOffset = 0, 0, 0, 0
 			m.status = "Switched to sheet " + m.currentSheet().Name
 		}
-	case "shift+tab", "[":
+	case "shift+tab", "[", "pgup":
 		if len(m.workbook.Sheets) > 0 {
 			m.sheetIndex = (m.sheetIndex - 1 + len(m.workbook.Sheets)) % len(m.workbook.Sheets)
 			m.row, m.col, m.rowOffset, m.colOffset = 0, 0, 0, 0
@@ -162,6 +185,53 @@ func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "m":
 		m.modeIndex = (m.modeIndex + 1) % len(displayModes)
 		m.status = "Display mode: " + displayModes[m.modeIndex]
+	case "x":
+		coord := m.currentCoord().A1()
+		m.currentSheet().SetCell(m.row, m.col, "")
+		formula.RecalculateWorkbook(m.workbook)
+		m.status = "Cleared " + coord
+	case "o":
+		m.currentSheet().InsertRow(m.row + 1)
+		formula.RecalculateWorkbook(m.workbook)
+		m.row++
+		m.status = fmt.Sprintf("Inserted row %d", m.row+1)
+	case "O":
+		m.currentSheet().InsertRow(m.row)
+		formula.RecalculateWorkbook(m.workbook)
+		m.status = fmt.Sprintf("Inserted row %d above", m.row+1)
+	case "D":
+		m.currentSheet().DeleteRow(m.row)
+		formula.RecalculateWorkbook(m.workbook)
+		if m.row > 0 {
+			m.row--
+		}
+		m.status = fmt.Sprintf("Deleted row %d", m.row+1)
+	case "C":
+		m.currentSheet().InsertCol(m.col)
+		formula.RecalculateWorkbook(m.workbook)
+		m.col++
+		m.status = fmt.Sprintf("Inserted column %s", workbook.Coord{Col: m.col}.ColumnName())
+	case "E":
+		m.currentSheet().DeleteCol(m.col)
+		formula.RecalculateWorkbook(m.workbook)
+		if m.col > 0 {
+			m.col--
+		}
+		m.status = fmt.Sprintf("Deleted column %s", workbook.Coord{Col: m.col}.ColumnName())
+	case "N":
+		m.promptActive = true
+		m.promptLabel = "New sheet name"
+		m.promptBuffer = ""
+		m.promptCursor = 0
+		m.promptTarget = "new_sheet"
+		m.status = "Enter new sheet name, then press Enter"
+	case "F2":
+		m.promptActive = true
+		m.promptLabel = "Rename sheet (was: " + m.currentSheet().Name + ")"
+		m.promptBuffer = m.currentSheet().Name
+		m.promptCursor = len([]rune(m.currentSheet().Name))
+		m.promptTarget = "rename"
+		m.status = "Enter new name for sheet, then press Enter"
 	}
 	m.ensureVisible()
 	return m, nil
@@ -213,6 +283,23 @@ func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.editBuffer = ""
 		m.editCursor = 0
 		return m, nil
+	case "up":
+		step := m.editInnerWidth()
+		if m.editCursor >= step {
+			m.editCursor -= step
+		} else {
+			m.editCursor = 0
+		}
+		return m, nil
+	case "down":
+		step := m.editInnerWidth()
+		next := m.editCursor + step
+		max := len([]rune(m.editBuffer))
+		if next > max {
+			next = max
+		}
+		m.editCursor = next
+		return m, nil
 	}
 	if msg.Type == tea.KeyRunes {
 		m.editBuffer = insertAtCursor(m.editBuffer, m.editCursor, string(msg.Runes))
@@ -239,7 +326,7 @@ func (m model) View() string {
 	builder.WriteString(renderFormulaBar(m))
 	builder.WriteString("\n")
 	if m.editMode {
-		builder.WriteString(renderBoxRow([]boxData{{Title: "Edit", Value: renderEditBuffer(m.editBuffer, m.editCursor)}}))
+		builder.WriteString(renderMultilineEditBox(m))
 		builder.WriteString("\n")
 	} else {
 		builder.WriteString(renderDashboardStrip(m))
@@ -247,8 +334,13 @@ func (m model) View() string {
 	}
 	builder.WriteString(m.renderGrid())
 	builder.WriteString("\n")
+	if m.promptActive {
+		builder.WriteString(renderPromptBox(m))
+		builder.WriteString("\n")
+	}
 	builder.WriteString(m.status + "\n")
-	builder.WriteString("Keys: arrows/hjkl move, enter/e edit, ctrl+s save, r recalc, [ ] switch sheet, m mode, d dashboard, q quit")
+	builder.WriteString("Keys: arrows move, Enter edit, Tab/Shift+Tab sheet, d dashboard, Ctrl+S save, q quit\n")
+	builder.WriteString("Advanced: h/j/k/l move, r recalc, m mode, x clear, o/O rows, D delete row, C/E columns, N new sheet, F2 rename")
 	return builder.String()
 }
 
@@ -291,7 +383,7 @@ func (m model) renderGrid() string {
 			absoluteCol := m.colOffset + col
 			content := m.renderGridCell(sheet.GetCell(absoluteRow, absoluteCol))
 			if absoluteRow == m.row && absoluteCol == m.col {
-				content = selectedCellStyle.Render(" " + trimToWidth(stripANSI(content), cellWidth-2))
+				content = styleSelectedGridContent(content, cellWidth)
 			} else {
 				content = styleGridContent(content, cellWidth)
 			}
@@ -466,6 +558,12 @@ func renderEditBuffer(value string, cursor int) string {
 func styleGridContent(value string, width int) string {
 	plain := " " + trimToWidth(stripANSI(value), width-2)
 	return padRight(plain, width)
+}
+
+func styleSelectedGridContent(value string, width int) string {
+	plain := " " + trimToWidth(stripANSI(value), width-2)
+	plain = padRight(plain, width)
+	return selectedCellStyle.Render(plain)
 }
 
 func stripANSI(value string) string {
@@ -671,8 +769,173 @@ func (m model) currentSheet() *workbook.Sheet {
 func (m model) currentCoord() workbook.Coord {
 	return workbook.Coord{Row: m.row, Col: m.col}
 }
+func (m model) editInnerWidth() int {
+	w := m.width - 4
+	if w < 20 {
+		w = 20
+	}
+	return w
+}
 
-func FileExists(path string) bool {
+// renderMultilineEditBox renders a full-width bordered textarea for the edit buffer.
+// Content wraps at editInnerWidth, cursor shown in context; Up/Down in edit mode shift by innerWidth.
+func renderMultilineEditBox(m model) string {
+	innerWidth := m.editInnerWidth()
+	bufRunes := []rune(m.editBuffer)
+	cursor := m.editCursor
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(bufRunes) {
+		cursor = len(bufRunes)
+	}
+
+	// Split the buffer into visual lines of innerWidth
+	var lines [][]rune
+	for i := 0; i <= len(bufRunes); i += innerWidth {
+		end := i + innerWidth
+		if end > len(bufRunes) {
+			end = len(bufRunes)
+		}
+		lines = append(lines, bufRunes[i:end])
+		if end == len(bufRunes) {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		lines = [][]rune{{}}
+	}
+
+	cursorLine := cursor / innerWidth
+	cursorCol := cursor % innerWidth
+
+	// Show 3 content rows; scroll so cursorLine is always visible
+	visRows := 3
+	startLine := cursorLine - visRows + 1
+	if startLine < 0 {
+		startLine = 0
+	}
+
+	var builder strings.Builder
+	title := " Edit — Up/Down move cursor line, Esc cancels, Enter confirms "
+	boxWidth := innerWidth + 2
+	builder.WriteString("┌")
+	builder.WriteString(trimToWidth(title+"─"+strings.Repeat("─", boxWidth), boxWidth))
+	builder.WriteString("┐\n")
+	for i := startLine; i < startLine+visRows; i++ {
+		builder.WriteString("│ ")
+		var lineContent string
+		if i < len(lines) {
+			if i == cursorLine {
+				lineContent = renderEditBuffer(string(lines[i]), cursorCol)
+			} else {
+				lineContent = string(lines[i])
+			}
+		}
+		plain := padRight(lineContent, innerWidth)
+		builder.WriteString(plain)
+		builder.WriteString(" │\n")
+	}
+	builder.WriteString("└")
+	builder.WriteString(strings.Repeat("─", boxWidth))
+	builder.WriteString("┘")
+	return builder.String()
+}
+
+// renderPromptBox renders a centered prompt input overlay.
+func renderPromptBox(m model) string {
+	labelWidth := runeLen(m.promptLabel)
+	bufDisplay := renderEditBuffer(m.promptBuffer, m.promptCursor)
+	bufWidth := runeLen(stripANSI(m.promptBuffer))
+	if bufWidth < 30 {
+		bufWidth = 30
+	}
+	contentWidth := labelWidth
+	if bufWidth > contentWidth {
+		contentWidth = bufWidth
+	}
+	contentWidth += 4
+	var builder strings.Builder
+	builder.WriteString("┌")
+	builder.WriteString(strings.Repeat("─", contentWidth))
+	builder.WriteString("┐\n")
+	builder.WriteString("│ ")
+	builder.WriteString(padRight(m.promptLabel, contentWidth-2))
+	builder.WriteString(" │\n")
+	builder.WriteString("├")
+	builder.WriteString(strings.Repeat("─", contentWidth))
+	builder.WriteString("┤\n")
+	builder.WriteString("│ ")
+	builder.WriteString(padRight(bufDisplay, contentWidth-2))
+	builder.WriteString(" │\n")
+	builder.WriteString("└")
+	builder.WriteString(strings.Repeat("─", contentWidth))
+	builder.WriteString("┘")
+	return builder.String()
+}
+
+func (m model) updatePrompt(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.promptActive = false
+		m.status = "Prompt cancelled"
+		return m, nil
+	case "enter":
+		name := strings.TrimSpace(m.promptBuffer)
+		if name == "" {
+			m.status = "Name cannot be empty"
+			m.promptActive = false
+			return m, nil
+		}
+		switch m.promptTarget {
+		case "new_sheet":
+			m.workbook.AddSheet(name)
+			m.sheetIndex = len(m.workbook.Sheets) - 1
+			m.row, m.col, m.rowOffset, m.colOffset = 0, 0, 0, 0
+			m.status = "Created sheet " + name
+		case "rename":
+			m.currentSheet().Name = name
+			m.status = "Renamed sheet to " + name
+		}
+		m.promptActive = false
+		return m, nil
+	case "left", "ctrl+b":
+		if m.promptCursor > 0 {
+			m.promptCursor--
+		}
+	case "right", "ctrl+f":
+		if m.promptCursor < len([]rune(m.promptBuffer)) {
+			m.promptCursor++
+		}
+	case "home", "ctrl+a":
+		m.promptCursor = 0
+	case "end", "ctrl+e":
+		m.promptCursor = len([]rune(m.promptBuffer))
+	case "backspace", "ctrl+h":
+		if m.promptCursor > 0 {
+			m.promptBuffer = removeRuneAt(m.promptBuffer, m.promptCursor-1)
+			m.promptCursor--
+		}
+	case "delete":
+		if m.promptCursor < len([]rune(m.promptBuffer)) {
+			m.promptBuffer = removeRuneAt(m.promptBuffer, m.promptCursor)
+		}
+	case "ctrl+u":
+		m.promptBuffer = ""
+		m.promptCursor = 0
+	default:
+		if msg.Type == tea.KeyRunes {
+			m.promptBuffer = insertAtCursor(m.promptBuffer, m.promptCursor, string(msg.Runes))
+			m.promptCursor += len(msg.Runes)
+		}
+		if msg.Type == tea.KeySpace {
+			m.promptBuffer = insertAtCursor(m.promptBuffer, m.promptCursor, " ")
+			m.promptCursor++
+		}
+	}
+	return m, nil
+}
+func (m model) FileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }

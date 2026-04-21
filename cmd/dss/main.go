@@ -27,7 +27,7 @@ func run(args []string) error {
 		printUsage()
 		return nil
 	}
-	if tui.FileExists(args[0]) {
+	if fileExists(args[0]) {
 		return runTUI(args)
 	}
 
@@ -84,7 +84,14 @@ func runDashboard(args []string) error {
 	if len(args) != 1 {
 		return errors.New("dashboard requires exactly one input file")
 	}
-	return dashboard.Run(args[0])
+	action, err := dashboard.Run(args[0])
+	if err != nil {
+		return err
+	}
+	if action == dashboard.ExitToTUI {
+		return tui.Run(args[0], "")
+	}
+	return nil
 }
 
 func runConvert(args []string) error {
@@ -159,4 +166,9 @@ func splitFlagArgs(args []string, flagsWithValues map[string]bool) ([]string, []
 		}
 	}
 	return flagArgs, positionals, nil
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }

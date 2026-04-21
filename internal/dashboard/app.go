@@ -12,6 +12,7 @@ import (
 	"github.com/mum4k/termdash/linestyle"
 	"github.com/mum4k/termdash/terminal/tcell"
 	"github.com/mum4k/termdash/terminal/terminalapi"
+	"github.com/mum4k/termdash/widgets/barchart"
 	textwidget "github.com/mum4k/termdash/widgets/text"
 
 	"github.com/vincm/dss/dss-go/internal/formula"
@@ -19,51 +20,77 @@ import (
 	"github.com/vincm/dss/dss-go/internal/workbook"
 )
 
-func Run(inputPath string) error {
+type ExitAction int
+
+const (
+	ExitClose ExitAction = iota
+	ExitToTUI
+)
+
+func Run(inputPath string) (ExitAction, error) {
 	wb, err := importers.LoadWorkbook(inputPath)
 	if err != nil {
-		return err
+		return ExitClose, err
 	}
+	return RunWorkbook(inputPath, wb)
+}
+
+func RunWorkbook(inputPath string, wb *workbook.Workbook) (ExitAction, error) {
 	formula.RecalculateWorkbook(wb)
 
 	terminal, err := tcell.New()
 	if err != nil {
-		return err
+		return ExitClose, err
 	}
 	defer terminal.Close()
 
 	header, err := textwidget.New(textwidget.DisableScrolling(), textwidget.WrapAtWords())
 	if err != nil {
-		return err
+		return ExitClose, err
 	}
 	if err := header.Write(buildHeader(inputPath, wb), textwidget.WriteReplace()); err != nil {
-		return err
+		return ExitClose, err
 	}
 
 	sheetsPanel, err := textwidget.New(textwidget.WrapAtWords())
 	if err != nil {
-		return err
+		return ExitClose, err
 	}
 	if err := sheetsPanel.Write(buildSheetPanel(wb), textwidget.WriteReplace()); err != nil {
-		return err
+		return ExitClose, err
 	}
 
 	statsPanel, err := textwidget.New(textwidget.WrapAtWords())
 	if err != nil {
-		return err
+		return ExitClose, err
 	}
 	if err := statsPanel.Write(buildStatsPanel(wb), textwidget.WriteReplace()); err != nil {
-		return err
+		return ExitClose, err
 	}
 
 	legendPanel, err := textwidget.New(textwidget.WrapAtWords())
 	if err != nil {
-		return err
+		return ExitClose, err
 	}
 	if err := legendPanel.Write(buildLegendPanel(), textwidget.WriteReplace()); err != nil {
-		return err
+		return ExitClose, err
 	}
 
+	// Build barchart: filled cells per sheet
+	cellValues, cellMax, cellLabels := buildCellsChart(wb)
+	bc, err := barchart.New(
+		barchart.ShowValues(),
+		barchart.BarWidth(3),
+		barchart.BarGap(1),
+	)
+	if err != nil {
+		return ExitClose, err
+	}
+	if len(cellValues) > 0 {
+		if err := bc.Values(cellValues, cellMax, barchart.Labels(cellLabels)); err != nil {
+			return ExitClose, err
+		}
+	}
 	root, err := container.New(
 		terminal,
 		container.Border(linestyle.Light),
@@ -84,9 +111,19 @@ func Run(inputPath string) error {
 					container.Right(
 						container.SplitHorizontal(
 							container.Top(
-								container.Border(linestyle.Light),
-								container.BorderTitle("Stats"),
-								container.PlaceWidget(statsPanel),
+								container.SplitVertical(
+									container.Left(
+										container.Border(linestyle.Light),
+										container.BorderTitle("Stats"),
+										container.PlaceWidget(statsPanel),
+									),
+									container.Right(
+										container.Border(linestyle.Light),
+										container.BorderTitle("Cells / Sheet"),
+										container.PlaceWidget(bc),
+									),
+									container.SplitPercent(55),
+								),
 							),
 							container.Bottom(
 								container.Border(linestyle.Light),
@@ -96,21 +133,27 @@ func Run(inputPath string) error {
 							container.SplitPercent(70),
 						),
 					),
-					container.SplitPercent(55),
+					container.SplitPercent(45),
 				),
 			),
 			container.SplitFixed(5),
 		),
 	)
 	if err != nil {
-		return err
+		return ExitClose, err
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	action := ExitClose
 
-	return termdash.Run(ctx, terminal, root,
+	err = termdash.Run(ctx, terminal, root,
 		termdash.KeyboardSubscriber(func(k *terminalapi.Keyboard) {
+			if k.Key == keyboard.KeyEnter || k.Key == keyboard.Key('e') || k.Key == keyboard.Key('E') {
+				action = ExitToTUI
+				cancel()
+				return
+			}
 			if k.Key == keyboard.KeyCtrlC || k.Key == keyboard.KeyCtrlQ || k.Key == keyboard.Key('q') || k.Key == keyboard.Key('Q') {
 				cancel()
 			}
@@ -119,6 +162,7 @@ func Run(inputPath string) error {
 			cancel()
 		}),
 	)
+	return action, err
 }
 
 func buildHeader(inputPath string, wb *workbook.Workbook) string {
@@ -205,8 +249,23 @@ func buildStatsPanel(wb *workbook.Workbook) string {
 
 func buildLegendPanel() string {
 	return strings.Join([]string{
+		"Enter / e: open the editable spreadsheet view",
 		"q / Ctrl+Q / Ctrl+C: close dashboard",
 		"Use `dss <file>` for the editable spreadsheet TUI",
 		"Use `dss convert input output.dss` to export directly",
 	}, "\n")
+}
+
+// buildCellsChart returns values, max, and labels for a per-sheet cells barchart.
+func buildCellsChart(wb *workbook.Workbook) (values []int, max int, labels []string) {
+	max = 1
+	for _, sheet := range wb.Sheets {
+		count := len(sheet.Cells)
+		values = append(values, count)
+		labels = append(labels, sheet.Name)
+		if count > max {
+			max = count
+		}
+	}
+	return values, max, labels
 }

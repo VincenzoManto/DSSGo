@@ -141,6 +141,58 @@ func (s *Sheet) SortedCoords() []Coord {
 	return coords
 }
 
+// InsertRow shifts all cells at row >= row down by one.
+func (s *Sheet) InsertRow(row int) {
+	newCells := make(map[Coord]*Cell, len(s.Cells))
+	for coord, cell := range s.Cells {
+		if coord.Row >= row {
+			newCells[Coord{Row: coord.Row + 1, Col: coord.Col}] = cell
+		} else {
+			newCells[coord] = cell
+		}
+	}
+	s.Cells = newCells
+}
+
+// DeleteRow removes all cells at row and shifts cells below it up by one.
+func (s *Sheet) DeleteRow(row int) {
+	newCells := make(map[Coord]*Cell, len(s.Cells))
+	for coord, cell := range s.Cells {
+		if coord.Row < row {
+			newCells[coord] = cell
+		} else if coord.Row > row {
+			newCells[Coord{Row: coord.Row - 1, Col: coord.Col}] = cell
+		}
+	}
+	s.Cells = newCells
+}
+
+// InsertCol shifts all cells at col >= col right by one.
+func (s *Sheet) InsertCol(col int) {
+	newCells := make(map[Coord]*Cell, len(s.Cells))
+	for coord, cell := range s.Cells {
+		if coord.Col >= col {
+			newCells[Coord{Row: coord.Row, Col: coord.Col + 1}] = cell
+		} else {
+			newCells[coord] = cell
+		}
+	}
+	s.Cells = newCells
+}
+
+// DeleteCol removes all cells at col and shifts cells to the right of it left by one.
+func (s *Sheet) DeleteCol(col int) {
+	newCells := make(map[Coord]*Cell, len(s.Cells))
+	for coord, cell := range s.Cells {
+		if coord.Col < col {
+			newCells[coord] = cell
+		} else if coord.Col > col {
+			newCells[Coord{Row: coord.Row, Col: coord.Col - 1}] = cell
+		}
+	}
+	s.Cells = newCells
+}
+
 func (s *Sheet) Bounds() (minRow int, minCol int, maxRow int, maxCol int, ok bool) {
 	if len(s.Cells) == 0 {
 		return 0, 0, 0, 0, false
