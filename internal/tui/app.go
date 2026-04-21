@@ -1,0 +1,678 @@
+package tui
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/vincm/dss/dss-go/internal/dashboard"
+	"github.com/vincm/dss/dss-go/internal/dss"
+	"github.com/vincm/dss/dss-go/internal/formula"
+	"github.com/vincm/dss/dss-go/internal/importers"
+	"github.com/vincm/dss/dss-go/internal/workbook"
+)
+
+const (
+	rowLabelWidth = 6
+	cellWidth     = 16
+	minGridRows   = 5
+)
+
+type model struct {
+	workbook   *workbook.Workbook
+	inputPath  string
+	outputPath string
+	sheetIndex int
+	row        int
+	col        int
+	rowOffset  int
+	colOffset  int
+	width      int
+	height     int
+	modeIndex  int
+	editMode   bool
+	editBuffer string
+	editCursor int
+	status     string
+	quit       bool
+	openDash   bool
+}
+
+var displayModes = []string{"values", "formulas", "both"}
+
+var (
+	titleStyle          = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("205"))
+	selectedCellStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("229")).Background(lipgloss.Color("25")).Bold(true)
+	formulaCellStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
+	errorCellStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("203")).Bold(true)
+	formulaBarCellStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("117")).Bold(true)
+)
+
+func Run(inputPath string, outputPath string) error {
+	wb, err := importers.LoadWorkbook(inputPath)
+	if err != nil {
+		return err
+	}
+	formula.RecalculateWorkbook(wb)
+	if outputPath == "" {
+		outputPath = defaultOutputPath(inputPath)
+	}
+	program := tea.NewProgram(model{
+		workbook:   wb,
+		inputPath:  inputPath,
+		outputPath: outputPath,
+		status:     "Arrows move, Enter edits, Ctrl+S saves, [ and ] switch sheets, m changes display mode.",
+	}, tea.WithAltScreen())
+	finalModel, err := program.Run()
+	if err != nil {
+		return err
+	}
+	if m, ok := finalModel.(model); ok && m.quit {
+		if m.openDash {
+			return dashboard.Run(m.inputPath)
+		}
+		return nil
+	}
+	return nil
+}
+
+func defaultOutputPath(inputPath string) string {
+	ext := filepath.Ext(inputPath)
+	if strings.EqualFold(ext, ".dss") {
+		return inputPath
+	}
+	return strings.TrimSuffix(inputPath, ext) + ".dss"
+}
+
+func (m model) Init() tea.Cmd {
+	return nil
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.ensureVisible()
+		return m, nil
+	case tea.KeyMsg:
+		if m.editMode {
+			return m.updateEdit(msg)
+		}
+		return m.updateNormal(msg)
+	}
+	return m, nil
+}
+
+func (m model) updateNormal(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		m.quit = true
+		return m, tea.Quit
+	case "d":
+		m.quit = true
+		m.openDash = true
+		return m, tea.Quit
+	case "up", "k":
+		if m.row > 0 {
+			m.row--
+		}
+	case "down", "j":
+		m.row++
+	case "left", "h":
+		if m.col > 0 {
+			m.col--
+		}
+	case "right", "l":
+		m.col++
+	case "enter", "e":
+		m.editMode = true
+		if cell := m.currentSheet().GetCell(m.row, m.col); cell != nil {
+			m.editBuffer = cell.Input
+		} else {
+			m.editBuffer = ""
+		}
+		m.editCursor = len([]rune(m.editBuffer))
+		m.status = "Editing cell " + m.currentCoord().A1() + ". Enter applies, Esc cancels, arrows move the edit cursor."
+	case "ctrl+s":
+		if err := dss.WriteFile(m.outputPath, m.workbook); err != nil {
+			m.status = "Save failed: " + err.Error()
+		} else {
+			m.status = "Saved DSS to " + m.outputPath
+		}
+	case "r":
+		formula.RecalculateWorkbook(m.workbook)
+		m.status = "Recalculated workbook"
+	case "tab", "]":
+		if len(m.workbook.Sheets) > 0 {
+			m.sheetIndex = (m.sheetIndex + 1) % len(m.workbook.Sheets)
+			m.row, m.col, m.rowOffset, m.colOffset = 0, 0, 0, 0
+			m.status = "Switched to sheet " + m.currentSheet().Name
+		}
+	case "shift+tab", "[":
+		if len(m.workbook.Sheets) > 0 {
+			m.sheetIndex = (m.sheetIndex - 1 + len(m.workbook.Sheets)) % len(m.workbook.Sheets)
+			m.row, m.col, m.rowOffset, m.colOffset = 0, 0, 0, 0
+			m.status = "Switched to sheet " + m.currentSheet().Name
+		}
+	case "m":
+		m.modeIndex = (m.modeIndex + 1) % len(displayModes)
+		m.status = "Display mode: " + displayModes[m.modeIndex]
+	}
+	m.ensureVisible()
+	return m, nil
+}
+
+func (m model) updateEdit(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.editMode = false
+		m.status = "Edit cancelled"
+		return m, nil
+	case "enter":
+		m.currentSheet().SetCell(m.row, m.col, m.editBuffer)
+		formula.RecalculateWorkbook(m.workbook)
+		m.editMode = false
+		m.status = "Updated " + m.currentCoord().A1()
+		return m, nil
+	case "left", "ctrl+b":
+		if m.editCursor > 0 {
+			m.editCursor--
+		}
+		return m, nil
+	case "right", "ctrl+f":
+		if m.editCursor < len([]rune(m.editBuffer)) {
+			m.editCursor++
+		}
+		return m, nil
+	case "home", "ctrl+a":
+		m.editCursor = 0
+		return m, nil
+	case "end", "ctrl+e":
+		m.editCursor = len([]rune(m.editBuffer))
+		return m, nil
+	case "backspace", "ctrl+h":
+		if m.editCursor > 0 {
+			m.editBuffer = removeRuneAt(m.editBuffer, m.editCursor-1)
+			m.editCursor--
+		}
+		return m, nil
+	case "delete":
+		if m.editCursor < len([]rune(m.editBuffer)) {
+			m.editBuffer = removeRuneAt(m.editBuffer, m.editCursor)
+		} else {
+			m.editBuffer = ""
+			m.editCursor = 0
+		}
+		return m, nil
+	case "ctrl+u":
+		m.editBuffer = ""
+		m.editCursor = 0
+		return m, nil
+	}
+	if msg.Type == tea.KeyRunes {
+		m.editBuffer = insertAtCursor(m.editBuffer, m.editCursor, string(msg.Runes))
+		m.editCursor += len(msg.Runes)
+	}
+	if msg.Type == tea.KeySpace {
+		m.editBuffer = insertAtCursor(m.editBuffer, m.editCursor, " ")
+		m.editCursor++
+	}
+	return m, nil
+}
+
+func (m model) View() string {
+	if len(m.workbook.Sheets) == 0 {
+		return "No sheets loaded\n"
+	}
+	var builder strings.Builder
+	builder.WriteString(titleStyle.Render("DSS Terminal Spreadsheet"))
+	builder.WriteString("\n")
+	builder.WriteString(renderTabs(m.workbook.Sheets, m.sheetIndex))
+	builder.WriteString("\n")
+	builder.WriteString("Input: " + m.inputPath + "\n")
+	builder.WriteString("Save:  " + m.outputPath + "\n")
+	builder.WriteString(renderFormulaBar(m))
+	builder.WriteString("\n")
+	if m.editMode {
+		builder.WriteString(renderBoxRow([]boxData{{Title: "Edit", Value: renderEditBuffer(m.editBuffer, m.editCursor)}}))
+		builder.WriteString("\n")
+	} else {
+		builder.WriteString(renderDashboardStrip(m))
+		builder.WriteString("\n")
+	}
+	builder.WriteString(m.renderGrid())
+	builder.WriteString("\n")
+	builder.WriteString(m.status + "\n")
+	builder.WriteString("Keys: arrows/hjkl move, enter/e edit, ctrl+s save, r recalc, [ ] switch sheet, m mode, d dashboard, q quit")
+	return builder.String()
+}
+
+func renderTabs(sheets []*workbook.Sheet, current int) string {
+	parts := make([]string, 0, len(sheets))
+	for index, sheet := range sheets {
+		if index == current {
+			parts = append(parts, "["+sheet.Name+"]")
+			continue
+		}
+		parts = append(parts, " "+sheet.Name+" ")
+	}
+	return strings.Join(parts, " | ")
+}
+
+func (m model) renderGrid() string {
+	rowsVisible := m.visibleRowCount()
+	colsVisible := m.visibleColCount()
+	sheet := m.currentSheet()
+	var builder strings.Builder
+	builder.WriteString(renderHorizontalBorder(colsVisible))
+	builder.WriteString("\n")
+	builder.WriteString("│")
+	builder.WriteString(padCenter("#", rowLabelWidth))
+	builder.WriteString("│")
+	for col := 0; col < colsVisible; col++ {
+		label := workbook.Coord{Col: m.colOffset + col}.ColumnName()
+		builder.WriteString(padCenter(label, cellWidth))
+		builder.WriteString("│")
+	}
+	builder.WriteString("\n")
+	builder.WriteString(renderHeaderDivider(colsVisible))
+	builder.WriteString("\n")
+	for row := 0; row < rowsVisible; row++ {
+		absoluteRow := m.rowOffset + row
+		builder.WriteString("│")
+		builder.WriteString(padCenter(fmt.Sprintf("%d", absoluteRow+1), rowLabelWidth))
+		builder.WriteString("│")
+		for col := 0; col < colsVisible; col++ {
+			absoluteCol := m.colOffset + col
+			content := m.renderGridCell(sheet.GetCell(absoluteRow, absoluteCol))
+			if absoluteRow == m.row && absoluteCol == m.col {
+				content = selectedCellStyle.Render(" " + trimToWidth(stripANSI(content), cellWidth-2))
+			} else {
+				content = styleGridContent(content, cellWidth)
+			}
+			builder.WriteString(content)
+			builder.WriteString("│")
+		}
+		builder.WriteString("\n")
+		if row == rowsVisible-1 {
+			builder.WriteString(renderBottomBorder(colsVisible))
+		} else {
+			builder.WriteString(renderMiddleDivider(colsVisible))
+		}
+		builder.WriteString("\n")
+	}
+	return builder.String()
+}
+
+func (m model) renderGridCell(cell *workbook.Cell) string {
+	if cell == nil {
+		return ""
+	}
+	var content string
+	switch displayModes[m.modeIndex] {
+	case "values":
+		if cell.Error != "" {
+			content = cell.Value + " !"
+		} else {
+			content = cell.Value
+		}
+	case "formulas":
+		content = cell.Input
+	default:
+		if cell.IsFormula() {
+			content = cell.Input + " => " + cell.Value
+		} else {
+			content = cell.Value
+		}
+	}
+	if cell.Error != "" {
+		return errorCellStyle.Render(content)
+	}
+	if cell.IsFormula() {
+		return formulaCellStyle.Render(content)
+	}
+	return content
+}
+
+func (m model) currentCellSummary() string {
+	coord := m.currentCoord()
+	cell := m.currentSheet().GetCell(m.row, m.col)
+	if cell == nil {
+		return fmt.Sprintf("Cell %s | input: <empty> | value: <empty>", coord.A1())
+	}
+	summary := fmt.Sprintf("Cell %s | input: %s | value: %s", coord.A1(), printable(cell.Input), printable(cell.Value))
+	if cell.Error != "" {
+		summary += " | error: " + cell.Error
+	}
+	return summary
+}
+
+func renderFormulaBar(m model) string {
+	coord := m.currentCoord()
+	cell := m.currentSheet().GetCell(m.row, m.col)
+	input := "<empty>"
+	value := "<empty>"
+	errorText := "none"
+	if cell != nil {
+		input = printable(cell.Input)
+		value = printable(cell.Value)
+		if cell.Error != "" {
+			errorText = cell.Error
+		}
+	}
+	if cell != nil && cell.IsFormula() {
+		input = formulaBarCellStyle.Render(input)
+	}
+	if cell != nil && cell.Error != "" {
+		errorText = errorCellStyle.Render(errorText)
+	}
+	return renderBoxRow([]boxData{
+		{Title: "Cell", Value: coord.A1()},
+		{Title: "Input", Value: input},
+		{Title: "Value", Value: value},
+		{Title: "Error", Value: errorText},
+	})
+}
+
+func printable(value string) string {
+	if value == "" {
+		return "<empty>"
+	}
+	return value
+}
+
+func padRight(value string, width int) string {
+	if runeLen(value) >= width {
+		return value
+	}
+	return value + strings.Repeat(" ", width-runeLen(value))
+}
+
+func padCenter(value string, width int) string {
+	length := runeLen(value)
+	if length >= width {
+		return trimToWidth(value, width)
+	}
+	left := (width - length) / 2
+	right := width - length - left
+	return strings.Repeat(" ", left) + value + strings.Repeat(" ", right)
+}
+
+func trimToWidth(value string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= width {
+		return value
+	}
+	if width == 1 {
+		return string(runes[:1])
+	}
+	return string(runes[:width-1]) + "…"
+}
+
+func runeLen(value string) int {
+	return len([]rune(value))
+}
+
+func insertAtCursor(value string, cursor int, addition string) string {
+	runes := []rune(value)
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+	prefix := string(runes[:cursor])
+	suffix := string(runes[cursor:])
+	return prefix + addition + suffix
+}
+
+func removeRuneAt(value string, index int) string {
+	runes := []rune(value)
+	if index < 0 || index >= len(runes) {
+		return value
+	}
+	return string(runes[:index]) + string(runes[index+1:])
+}
+
+func renderEditBuffer(value string, cursor int) string {
+	runes := []rune(value)
+	if cursor < 0 {
+		cursor = 0
+	}
+	if cursor > len(runes) {
+		cursor = len(runes)
+	}
+	prefix := string(runes[:cursor])
+	suffix := string(runes[cursor:])
+	cursorGlyph := lipgloss.NewStyle().Reverse(true).Render(" ")
+	if cursor < len(runes) {
+		cursorGlyph = lipgloss.NewStyle().Reverse(true).Render(string(runes[cursor]))
+		suffix = string(runes[cursor+1:])
+	}
+	if value == "" {
+		return cursorGlyph
+	}
+	return prefix + cursorGlyph + suffix
+}
+
+func styleGridContent(value string, width int) string {
+	plain := " " + trimToWidth(stripANSI(value), width-2)
+	return padRight(plain, width)
+}
+
+func stripANSI(value string) string {
+	builder := strings.Builder{}
+	inEscape := false
+	for _, r := range value {
+		if r == '\u001b' {
+			inEscape = true
+			continue
+		}
+		if inEscape {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+				inEscape = false
+			}
+			continue
+		}
+		builder.WriteRune(r)
+	}
+	return builder.String()
+}
+
+func renderHorizontalBorder(colsVisible int) string {
+	var builder strings.Builder
+	builder.WriteString("┌")
+	builder.WriteString(strings.Repeat("─", rowLabelWidth))
+	builder.WriteString("┬")
+	for col := 0; col < colsVisible; col++ {
+		builder.WriteString(strings.Repeat("─", cellWidth))
+		if col == colsVisible-1 {
+			builder.WriteString("┐")
+		} else {
+			builder.WriteString("┬")
+		}
+	}
+	return builder.String()
+}
+
+func renderHeaderDivider(colsVisible int) string {
+	var builder strings.Builder
+	builder.WriteString("├")
+	builder.WriteString(strings.Repeat("─", rowLabelWidth))
+	builder.WriteString("┼")
+	for col := 0; col < colsVisible; col++ {
+		builder.WriteString(strings.Repeat("─", cellWidth))
+		if col == colsVisible-1 {
+			builder.WriteString("┤")
+		} else {
+			builder.WriteString("┼")
+		}
+	}
+	return builder.String()
+}
+
+func renderMiddleDivider(colsVisible int) string {
+	var builder strings.Builder
+	builder.WriteString("├")
+	builder.WriteString(strings.Repeat("─", rowLabelWidth))
+	builder.WriteString("┼")
+	for col := 0; col < colsVisible; col++ {
+		builder.WriteString(strings.Repeat("─", cellWidth))
+		if col == colsVisible-1 {
+			builder.WriteString("┤")
+		} else {
+			builder.WriteString("┼")
+		}
+	}
+	return builder.String()
+}
+
+func renderBottomBorder(colsVisible int) string {
+	var builder strings.Builder
+	builder.WriteString("└")
+	builder.WriteString(strings.Repeat("─", rowLabelWidth))
+	builder.WriteString("┴")
+	for col := 0; col < colsVisible; col++ {
+		builder.WriteString(strings.Repeat("─", cellWidth))
+		if col == colsVisible-1 {
+			builder.WriteString("┘")
+		} else {
+			builder.WriteString("┴")
+		}
+	}
+	return builder.String()
+}
+
+type boxData struct {
+	Title string
+	Value string
+}
+
+func renderDashboardStrip(m model) string {
+	filled := len(m.currentSheet().Cells)
+	formulaCount := 0
+	errorCount := 0
+	for _, coord := range m.currentSheet().SortedCoords() {
+		cell := m.currentSheet().GetCell(coord.Row, coord.Col)
+		if cell == nil {
+			continue
+		}
+		if cell.IsFormula() {
+			formulaCount++
+		}
+		if cell.Error != "" {
+			errorCount++
+		}
+	}
+	return renderBoxRow([]boxData{
+		{Title: "Sheet", Value: m.currentSheet().Name},
+		{Title: "Mode", Value: displayModes[m.modeIndex]},
+		{Title: "Cells", Value: fmt.Sprintf("%d", filled)},
+		{Title: "Formulas", Value: fmt.Sprintf("%d", formulaCount)},
+		{Title: "Errors", Value: fmt.Sprintf("%d", errorCount)},
+	})
+}
+
+func renderBoxRow(boxes []boxData) string {
+	if len(boxes) == 0 {
+		return ""
+	}
+	lineGroups := make([][]string, 0, len(boxes))
+	for _, item := range boxes {
+		lineGroups = append(lineGroups, renderInfoBox(item.Title, item.Value))
+	}
+	var builder strings.Builder
+	for lineIndex := 0; lineIndex < len(lineGroups[0]); lineIndex++ {
+		for boxIndex, lines := range lineGroups {
+			if boxIndex > 0 {
+				builder.WriteString("  ")
+			}
+			builder.WriteString(lines[lineIndex])
+		}
+		if lineIndex < len(lineGroups[0])-1 {
+			builder.WriteString("\n")
+		}
+	}
+	return builder.String()
+}
+
+func renderInfoBox(title string, value string) []string {
+	contentWidth := runeLen(title)
+	if runeLen(value) > contentWidth {
+		contentWidth = runeLen(value)
+	}
+	contentWidth += 2
+	return []string{
+		"┌" + strings.Repeat("─", contentWidth) + "┐",
+		"│" + padCenter(title, contentWidth) + "│",
+		"├" + strings.Repeat("─", contentWidth) + "┤",
+		"│" + padCenter(trimToWidth(value, contentWidth), contentWidth) + "│",
+		"└" + strings.Repeat("─", contentWidth) + "┘",
+	}
+}
+
+func (m *model) ensureVisible() {
+	rowsVisible := m.visibleRowCount()
+	colsVisible := m.visibleColCount()
+	if m.row < m.rowOffset {
+		m.rowOffset = m.row
+	}
+	if m.row >= m.rowOffset+rowsVisible {
+		m.rowOffset = m.row - rowsVisible + 1
+	}
+	if m.col < m.colOffset {
+		m.colOffset = m.col
+	}
+	if m.col >= m.colOffset+colsVisible {
+		m.colOffset = m.col - colsVisible + 1
+	}
+	if m.rowOffset < 0 {
+		m.rowOffset = 0
+	}
+	if m.colOffset < 0 {
+		m.colOffset = 0
+	}
+}
+
+func (m model) visibleRowCount() int {
+	rows := m.height - 17
+	if rows < minGridRows {
+		rows = minGridRows
+	}
+	return rows
+}
+
+func (m model) visibleColCount() int {
+	cols := (m.width - rowLabelWidth) / cellWidth
+	if cols < 1 {
+		cols = 1
+	}
+	return cols
+}
+
+func (m model) currentSheet() *workbook.Sheet {
+	if len(m.workbook.Sheets) == 0 {
+		return workbook.NewSheet("Sheet1")
+	}
+	if m.sheetIndex < 0 || m.sheetIndex >= len(m.workbook.Sheets) {
+		return m.workbook.Sheets[0]
+	}
+	return m.workbook.Sheets[m.sheetIndex]
+}
+
+func (m model) currentCoord() workbook.Coord {
+	return workbook.Coord{Row: m.row, Col: m.col}
+}
+
+func FileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
